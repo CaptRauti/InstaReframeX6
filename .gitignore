@@ -1,0 +1,11 @@
+# Build artifacts
+*.mp4
+*.insv
+*.png
+lens0.*
+lens1.*
+test/
+.venv/
+__pycache__/
+*.drp
+fuse_log.txt

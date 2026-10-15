@@ -1,0 +1,347 @@
+-- @mcp-fuse name=InstaReframeX6 kind=dctl_kernel type=tool
+-- InstaReframe X6: 360°-Reframe direkt aus den zwei Fisheye-Streams einer
+-- Insta360 X6 (INSV-Streams 0+1). Mapping: exakte v360-dfisheye-Mathematik
+-- (FFmpeg vf_v360.c, xyz_to_dfisheye), validiert an echtem X6-Material.
+-- Inputs:  Front = Stream 1 (vordere Linse, z>=0), Back = Stream 0 (hinten, z<0)
+
+FuRegisterClass("InstaReframeX6", CT_Tool, {
+    REGS_Category = "Fuses\\Insta360",
+    REGS_OpIconString = "X6R",
+    REGS_OpDescription = "Reframe aus 2 Insta360-X6-Fisheye-Streams (v360-Mapping)",
+})
+
+KernelParams = [[
+    float FOV;
+    float Pan;
+    float Tilt;
+    float Roll;
+    int   insize[2];
+    int   outsize[2];
+]]
+
+KernelSource = [[
+// X6-Linsenkalibrierung (aus .insv INFO f111/f112, verifiziert an
+// VID_20260918_205557_00_014, Firmware v1.1.78):
+//   Front (Stream 1, z>=0): xi 2.45543, fx 3611.11, cx 1926.45, cy 1939.42
+//   Back  (Stream 0, z<0):  xi 2.45543, fx 3603.76, cx 1930.63, cy 1943.50
+// Sensor-Roll (~89.66°) wird NICHT angewendet (verifiziert: verschlechtert).
+// Back-Linse ist um 180° um Y gedreht montiert -> Strahl-Rotation statt Flip.
+
+__KERNEL__ void InstaReframeX6Kernel(__CONSTANTREF__ KernelParams *params,
+                                     __TEXTURE2D__ src,
+                                     __TEXTURE2D__ src2,
+                                     __TEXTURE2D_WRITE__ dst)
+{
+    DEFINE_KERNEL_ITERATORS_XY(x, y);
+    if (x < params->outsize[0] && y < params->outsize[1])
+    {
+        const float PI = 3.14159265358979f;
+
+        // Pixel -> Richtungsvektor. MEI-Kalibrierung arbeitet in Y-DOWN-
+        // Konvention (cy ist Bildzeile, v wächst nach unten): NUR x invertieren
+        // (Bild-x rechts => Sphäre +x), y NICHT negieren (Bild-y unten => +y).
+        float focal = (params->outsize[1] * 0.5f) / _tanf(params->FOV * 0.5f * PI / 180.0f);
+        float dx = ((float)x - params->outsize[0] * 0.5f) / focal;
+        float dy = ((float)y - params->outsize[1] * 0.5f) / focal;
+        float dz = 1.0f;
+
+        // Roll um Z
+        float cr = _cosf(params->Roll * PI / 180.0f);
+        float sr = _sinf(params->Roll * PI / 180.0f);
+        float x1 = cr * dx - sr * dy;
+        float y1 = sr * dx + cr * dy;
+        float z1 = dz;
+
+        // Tilt um X
+        float ct = _cosf(params->Tilt * PI / 180.0f);
+        float st = _sinf(params->Tilt * PI / 180.0f);
+        float x2 = x1;
+        float y2 = ct * y1 - st * z1;
+        float z2 = st * y1 + ct * z1;
+
+        // Pan um Y
+        float cp = _cosf(params->Pan * PI / 180.0f);
+        float sp = _sinf(params->Pan * PI / 180.0f);
+        float x3 = cp * x2 + sp * z2;
+        float y3 = y2;
+        float z3 = -sp * x2 + cp * z2;
+
+        // normalisieren
+        float inv = 1.0f / _sqrtf(x3*x3 + y3*y3 + z3*z3);
+        x3 *= inv; y3 *= inv; z3 *= inv;
+
+        float iw = (float)params->insize[0];
+        float ih = (float)params->insize[1];
+        float u, v;
+        int ok = 0;
+
+        if (z3 >= 0.0f)
+        {
+            // ---- Front (Stream 1): extrinsisch nur yaw/pitch (klein) ----
+            // R_front.T @ ray (exakt aus .insv-Kalibrierung)
+            float Xl =  0.999973f*x3 + 0.00000f*y3 - 0.007295f*z3;
+            float Yl = -0.000023f*x3 + 0.999995f*y3 - 0.003142f*z3;
+            float Zl =  0.007295f*x3 + 0.003142f*y3 + 0.999968f*z3;
+            // MEI forward
+            float norm = _sqrtf(Xl*Xl + Yl*Yl + Zl*Zl);
+            if (norm > 1e-6f)
+            {
+                float Xs = Xl / norm, Ys = Yl / norm, Zs = Zl / norm;
+                float denom = Zs + 2.45543f;
+                if (denom > 1e-4f)
+                {
+                    float mx = Xs / denom;
+                    float my = Ys / denom;
+                    float r2 = mx*mx + my*my;
+                    float r4 = r2*r2;
+                    float radial = 1.0f + 1.31325f*r2 - 1.59305f*r4 + 6.99536f*r2*r4 - 2.58052f*r4*r4;
+                    float xd = mx*radial + 2.0f*(-0.00102256f)*mx*my - 0.00163018f*(r2 + 2.0f*mx*mx) - 0.00392101f*r2 + 0.0146974f*r4;
+                    float yd = my*radial - 0.00102256f*(r2 + 2.0f*my*my) + 2.0f*(-0.00163018f)*mx*my + 0.00406541f*r2 + 0.00244077f*r4;
+                    u = 3611.11f*xd + 1926.45f;
+                    v = 3611.11f*yd + 1939.42f;
+                    float rmax = (iw < ih ? iw : ih) * 0.5f * 0.97f;
+                    float du = u - 1926.45f, dv = v - 1939.42f;
+                    if (_sqrtf(du*du + dv*dv) <= rmax && u >= 0.0f && u <= iw - 1.0f && v >= 0.0f && v <= ih - 1.0f)
+                    {
+                        ok = 1;
+                    }
+                }
+            }
+            if (ok)
+            {
+                _tex2DVec4Write(dst, x, y, _tex2DVecN(src, u / (iw - 1.0f), v / (ih - 1.0f), 15));
+            }
+        }
+        else
+        {
+            // ---- Back (Stream 0): 180°-Y-Rotation (x,z -> -x,-z) + klein ----
+            // R_back.T @ ray (exakt aus .insv-Kalibrierung)
+            float Xl = -0.999986f*x3 + 0.00000f*y3 - 0.005288f*z3;
+            float Yl = -0.000016f*x3 + 0.999995f*y3 + 0.003107f*z3;
+            float Zl =  0.005288f*x3 + 0.003107f*y3 - 0.999981f*z3;
+            // MEI forward
+            float norm = _sqrtf(Xl*Xl + Yl*Yl + Zl*Zl);
+            if (norm > 1e-6f)
+            {
+                float Xs = Xl / norm, Ys = Yl / norm, Zs = Zl / norm;
+                float denom = Zs + 2.45543f;
+                if (denom > 1e-4f)
+                {
+                    float mx = Xs / denom;
+                    float my = Ys / denom;
+                    float r2 = mx*mx + my*my;
+                    float r4 = r2*r2;
+                    float radial = 1.0f + 1.27913f*r2 - 0.752754f*r4 + 0.472147f*r2*r4 + 15.4547f*r4*r4;
+                    float xd = mx*radial + 2.0f*0.00126113f*mx*my + 0.00033189f*(r2 + 2.0f*mx*mx) - 0.0065367f*r2 + 0.0131532f*r4;
+                    float yd = my*radial + 0.00126113f*(r2 + 2.0f*my*my) + 2.0f*0.00033189f*mx*my - 0.00036284f*r2 - 0.00159663f*r4;
+                    u = 3603.76f*xd + 1930.63f;
+                    v = 3603.76f*yd + 1943.50f;
+                    float rmax = (iw < ih ? iw : ih) * 0.5f * 0.97f;
+                    float du = u - 1930.63f, dv = v - 1943.50f;
+                    if (_sqrtf(du*du + dv*dv) <= rmax && u >= 0.0f && u <= iw - 1.0f && v >= 0.0f && v <= ih - 1.0f)
+                    {
+                        ok = 1;
+                    }
+                }
+            }
+            if (ok)
+            {
+                _tex2DVec4Write(dst, x, y, _tex2DVecN(src2, u / (iw - 1.0f), v / (ih - 1.0f), 15));
+            }
+        }
+    }
+}
+]]
+
+function Create()
+    InFOV = self:AddInput("FOV", "FOV", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 60.0,
+        INP_MinScale = 15.0,
+        INP_MaxScale = 170.0,
+    })
+
+    InPan = self:AddInput("Pan", "Pan (Yaw)", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.0,
+        INP_MinScale = -180.0,
+        INP_MaxScale = 180.0,
+    })
+
+    InTilt = self:AddInput("Tilt", "Tilt (Pitch)", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.0,
+        INP_MinScale = -90.0,
+        INP_MaxScale = 90.0,
+    })
+
+    InRoll = self:AddInput("Roll", "Roll", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.0,
+        INP_MinScale = -180.0,
+        INP_MaxScale = 180.0,
+    })
+
+    InOutW = self:AddInput("OutWidth", "Output Breite", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 1920.0,
+        INP_MinScale = 16.0,
+        INP_MaxScale = 7680.0,
+    })
+
+    InOutH = self:AddInput("OutHeight", "Output Hoehe", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 1080.0,
+        INP_MinScale = 16.0,
+        INP_MaxScale = 4320.0,
+    })
+
+    -- Aspect-Preset: steuert OutWidth/OutHeight bequem
+    InAspect = self:AddInput("Aspect", "Aspect Ratio", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_Default = 0,
+        { CCS_AddString = "4K UHD (3840x2160)" },
+        { CCS_AddString = "16:9 (1920x1080)" },
+        { CCS_AddString = "9:16 (1080x1920)" },
+        { CCS_AddString = "1:1 (1080x1080)" },
+        { CCS_AddString = "4:5 (1080x1350)" },
+        { CCS_AddString = "9:21 (1080x2520)" },
+        { CCS_AddString = "Custom" },
+        CC_LabelPosition = "Horizontal",
+    })
+
+    InFront = self:AddInput("Front", "Front", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+
+    InBack = self:AddInput("Back", "Back", {
+        LINKID_DataType = "Image",
+        LINK_Main = 2,
+    })
+
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+end
+
+function Process(req)
+    local ok, perr = pcall(function()
+        local front = InFront:GetValue(req)
+        local back  = InBack:GetValue(req)
+
+        if not (front and back) then
+            OutImage:Set(req, Image({ IMG_Like = front or back }))
+            return
+        end
+
+        local ow = math.floor(InOutW:GetValue(req).Value + 0.5)
+        local oh = math.floor(InOutH:GetValue(req).Value + 0.5)
+
+        -- Aspect-Preset ueberschreibt OutWidth/OutHeight (Custom = Slider-Werte)
+        -- ComboControl: 0-basiert (0=4K ... 5=9:21, 6=Custom).
+        -- GetValue(req) kann Zahl, table ODER userdata (struct Number)
+        -- liefern -> pcall-gesichert auf .Value zugreifen, nie vergleichen
+        -- ohne Konvertierung (Struct-Vergleich crasht sonst den Process).
+        local aspect = -1
+        local okR, av = pcall(function() return InAspect:GetValue(req) end)
+        if okR then
+            if type(av) == "number" then
+                aspect = av
+            else
+                local okV, v = pcall(function() return av.Value end)
+                if okV and type(v) == "number" then aspect = v end
+            end
+        end
+        if aspect == 0 then ow, oh = 3840, 2160
+        elseif aspect == 1 then ow, oh = 1920, 1080
+        elseif aspect == 2 then ow, oh = 1080, 1920
+        elseif aspect == 3 then ow, oh = 1080, 1080
+        elseif aspect == 4 then ow, oh = 1080, 1350
+        elseif aspect == 5 then ow, oh = 1080, 2520
+        end
+
+        ow = math.max(16, math.min(7680, ow))
+        oh = math.max(16, math.min(4320, oh))
+
+        -- Zielbild wie im offiziellen GPU sample.fuse erzeugen: EXPLIZITE
+        -- Groessen-Attribute + IMG_Document; erst daraus das out-Image ableiten.
+        -- (Image({IMG_Like = front, ...}) erbt das 3840er-Format des Eingangs!)
+        local xa, ya = 1, 1
+        if front.XAspectX and front.XAspectX ~= 0 then
+            xa = front.XAspectX
+            ya = front.YAspectY or 1
+        end
+        local img = Image({
+            IMG_Document = self.Comp,
+            IMG_Width = ow,
+            IMG_Height = oh,
+            IMG_XScale = xa,
+            IMG_YScale = ya,
+            IMG_Quality = not req:IsQuick(),
+            IMG_MotionBlurQuality = not req:IsNoMotionBlur(),
+        })
+        if not img then
+            LogFuse("Image() failed")
+            OutImage:Set(req, Image({ IMG_Like = front }))
+            return
+        end
+        local out = Image({ IMG_Like = img })
+
+        local node = DVIPComputeNode(req, "InstaReframeX6Kernel", KernelSource,
+                                     "KernelParams", KernelParams)
+        if not node then
+            LogFuse("DVIPComputeNode failed")
+            OutImage:Set(req, out)
+            return
+        end
+
+        local paramblock = node:GetParamBlock(KernelParams)
+        paramblock.FOV    = InFOV:GetValue(req).Value
+        paramblock.Pan    = InPan:GetValue(req).Value
+        paramblock.Tilt   = InTilt:GetValue(req).Value
+        paramblock.Roll   = InRoll:GetValue(req).Value
+        paramblock.insize[0]  = front.DataWindow:Width()
+        paramblock.insize[1]  = front.DataWindow:Height()
+        paramblock.outsize[0] = ow
+        paramblock.outsize[1] = oh
+        node:SetParamBlock(paramblock)
+
+        node:AddSampler("RowSampler", TEX_FILTER_MODE_LINEAR,
+                        TEX_ADDRESS_MODE_CLAMP, TEX_NORMALIZED_COORDS_TRUE)
+        node:AddSampler("RowSampler2", TEX_FILTER_MODE_LINEAR,
+                        TEX_ADDRESS_MODE_CLAMP, TEX_NORMALIZED_COORDS_TRUE)
+        node:AddInput("src", front)
+        node:AddInput("src2", back)
+        node:AddOutput("dst", out)
+
+        local okRun = node:RunSession(req)
+        if not okRun then
+            LogFuse("kernel run failed")
+        end
+
+        OutImage:Set(req, out)
+    end)
+    if not ok then
+        LogFuse("Process error: " .. tostring(perr))
+        local front = InFront:GetValue(req)
+        OutImage:Set(req, Image({ IMG_Like = front }))
+    end
+end
+
+function LogFuse(msg)
+    local okL, f = pcall(function() return io.open("C:\\Users\\stefa\\AppData\\Local\\hermes\\cache\\scratch\\x6\\fuse_log.txt", "a") end)
+    if okL and f then
+        f:write(msg .. "\n")
+        f:close()
+    end
+end
