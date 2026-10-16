@@ -36,6 +36,8 @@ KernelParams = [[
     float fm5;  float fm6;  float fm7;  float fm8;
     float bm0;  float bm1;  float bm2;  float bm3;  float bm4;
     float bm5;  float bm6;  float bm7;  float bm8;
+    float byaw;   // Naht-Feinabgleich: zusaetzliche Y-Rotation der Back-Linse (rad)
+    float bpitch; // Naht-Feinabgleich: zusaetzliche X-Rotation der Back-Linse (rad)
     int   insize[2];
     int   outsize[2];
 ]]
@@ -133,6 +135,22 @@ __KERNEL__ void InstaReframeX6Kernel(__CONSTANTREF__ KernelParams *params,
             float Xl = params->bm0*x3 + params->bm1*y3 + params->bm2*z3;
             float Yl = params->bm3*x3 + params->bm4*y3 + params->bm5*z3;
             float Zl = params->bm6*x3 + params->bm7*y3 + params->bm8*z3;
+            // Naht-Feinabgleich: zusaetzliche Yaw-/Pitch-Rotation der Back-Linse
+            // (korrigiert den Restversatz an der Naht; Default 0 = reine Kalibrierung)
+            if (params->byaw != 0.0f)
+            {
+                float cy = _cosf(params->byaw), sy = _sinf(params->byaw);
+                float Xr = cy*Xl - sy*Zl;
+                float Zr = sy*Xl + cy*Zl;
+                Xl = Xr; Zl = Zr;
+            }
+            if (params->bpitch != 0.0f)
+            {
+                float cp = _cosf(params->bpitch), sp = _sinf(params->bpitch);
+                float Yr = cp*Yl - sp*Zl;
+                float Zr2 = sp*Yl + cp*Zl;
+                Yl = Yr; Zl = Zr2;
+            }
             // MEI forward
             float norm = _sqrtf(Xl*Xl + Yl*Yl + Zl*Zl);
             if (norm > 1e-6f)
@@ -183,9 +201,43 @@ local DEFAULT_CALIB = {
     bm5=0.003107, bm6=0.005288, bm7=0.003107, bm8=-0.999981,
 }
 
+-- Text-Extraktion aus Text-Inputs: Resolve 21 liefert cdata<struct Text *>,
+-- nicht string. Probier-Kette aller bekannten Konventionen.
+local function textValue(inp, req)
+    local ok, v = pcall(function() return inp:GetValue(req) end)
+    if not ok or v == nil then return nil end
+    if type(v) == "string" then return v end
+    -- cdata: ..Value / [1] / tostring-nicht-Adresse / ffi.string
+    local tries = {
+        function() return v.Value end,
+        function() return v.value end,
+        function() return v[1] end,
+        function() return v[0] end,
+        function() return v.Text end,
+        function() return v.text end,
+    }
+    for i, fn in ipairs(tries) do
+        local ok2, r = pcall(fn)
+        if ok2 and type(r) == "string" then return r end
+    end
+    -- ffi.string direkt auf dem Pointer (wenn verfuegbar)
+    local okF, rF = pcall(function()
+        if ffi and ffi.string then return ffi.string(v) end
+        return nil
+    end)
+    if okF and type(rF) == "string" then return rF end
+    -- letzter Versuch: tostring, aber Adressformat verwerfen
+    local okT, rT = pcall(function() return tostring(v) end)
+    if okT and type(rT) == "string" and rT:match("^cdata") == nil and rT:match("^table") == nil then
+        return rT
+    end
+    return nil
+end
+
 -- Cache fuer Auto-Kalibrierung (Datei nur bei Pfad-Aenderung neu lesen)
 local calibCache = nil
 local calibCachePath = nil
+local calibCacheMtime = nil
 
 local function parseCalibFile(path)
     local okF, f = pcall(function() return io.open(path, "r") end)
@@ -204,21 +256,70 @@ local function parseCalibFile(path)
 end
 
 -- Findet .calib automatisch: gleicher Basisname wie der Front-Clip.
-local function findCalibPath(comp)
-    if not comp then return nil end
-    for i, t in pairs(comp:GetToolList(false)) do
-        local name = t:GetAttrs().TOOLS_Name
-        if name == "MediaIn1" then
-            local clip = t:GetAttrs().TOOLS_Clip_Path
-            if clip and clip ~= "" then
-                local base = clip:match("^(.*)%.[%w]+$") or clip
-                local cand = base .. ".calib"
-                local okF, f = pcall(function() return io.open(cand, "r") end)
-                if okF and f then
-                    f:close()
-                    return cand
+-- HINWEIS: Im Fuse-Kontext ist die Comp-API abgeschnitten (Resolve 21:
+-- GetToolList/FindTool/CurrentComp nicht verfuegbar), daher ist die
+-- Auto-Suche ein Best-Effort-Fallback — primaer ist der CalibFile-Input.
+local function findCalibPath(req)
+    -- Strategie D (bevorzugt, keine Comp-API): Pfad aus der Front-Textur.
+    -- Fusion-Images haben IMG_Attrs mit Quell-Info (z.B. IMG_FilePath).
+    if InFront then
+        local okI, img = pcall(function() return InFront:GetValue(req) end)
+        if okI and img then
+            local okA, attrs = pcall(function() return img:GetAttrs() end)
+            if okA and attrs then
+                for _, key in ipairs({ "IMG_FilePath", "IMG_Source", "IMG_FileName", "TOOLS_Clip_Path" }) do
+                    local okV, v = pcall(function() return attrs[key] end)
+                    if okV and type(v) == "string" and v ~= "" then
+                        local base = v:match("^(.*)%.[%w]+$") or v
+                        local cand = base .. ".calib"
+                        local okF, f = pcall(function() return io.open(cand, "r") end)
+                        if okF and f then
+                            f:close()
+                            return cand
+                        end
+                    end
                 end
             end
+        end
+    end
+
+    local comp = self.Comp or comp or comp2 or fusion.CurrentComp
+    if not comp then return nil end
+
+    -- Strategie A: GetToolList
+    local tool = nil
+    local okC, list = pcall(function() return comp:GetToolList(false) end)
+    if okC and type(list) == "table" then
+        for i, t in pairs(list) do
+            local okN, name = pcall(function() return t:GetAttrs().TOOLS_Name end)
+            if okN and name == "MediaIn1" then tool = t break end
+        end
+    end
+
+    -- Strategie B: FindTool direkt
+    if not tool then
+        local okF, t = pcall(function() return comp:FindTool("MediaIn1") end)
+        if okF and t then tool = t end
+    end
+
+    -- Strategie C: CurrentComp.FindTool
+    if not tool then
+        local okF, t = pcall(function() return fusion:GetCurrentComp():FindTool("MediaIn1") end)
+        if okF and t then tool = t end
+    end
+
+    if not tool then
+        return nil
+    end
+
+    local okP, clip = pcall(function() return tool:GetAttrs().TOOLS_Clip_Path end)
+    if okP and clip and clip ~= "" then
+        local base = clip:match("^(.*)%.[%w]+$") or clip
+        local cand = base .. ".calib"
+        local okF2, f = pcall(function() return io.open(cand, "r") end)
+        if okF2 and f then
+            f:close()
+            return cand
         end
     end
     return nil
@@ -249,6 +350,23 @@ function Create()
         INP_MaxScale = 90.0,
     })
 
+    -- NAHT-FEINABGLEICH: korrigiert den Restversatz zwischen Front- und
+    -- Back-Linse direkt an der Naht (Winkel in Grad). 0 = reine Kalibrierung.
+    InBackYaw = self:AddInput("BackYaw", "Naht-Feinabgleich Yaw (Grad)", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.0,
+        INP_MinScale = -5.0,
+        INP_MaxScale = 5.0,
+    })
+    InBackPitch = self:AddInput("BackPitch", "Naht-Feinabgleich Pitch (Grad)", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.0,
+        INP_MinScale = -5.0,
+        INP_MaxScale = 5.0,
+    })
+
     InRoll = self:AddInput("Roll", "Roll", {
         LINKID_DataType = "Number",
         INPID_InputControl = "SliderControl",
@@ -257,18 +375,39 @@ function Create()
         INP_MaxScale = 180.0,
     })
 
+    -- KALIBRIERUNG: expliziter Pfad (bevorzugt; setzt das Import-Skript
+    -- automatisch). Leer = automatische Suche neben dem Front-Clip.
+    -- ROBUST: pcall — TextEditControl wurde von dieser Resolve-Version
+    -- abgelehnt (Create brach ab); dann entfaellt nur der explizite Pfad.
+    -- Variante 2: OHNE INP_Default (leerer String koennte der Stolperstein
+    -- sein — 'cannot convert table to double' deutete auf Default-Problem).
+    local calOk = pcall(function()
+        InCalibFile = self:AddInput("CalibFile", "Kalibrierungsdatei (.calib)", {
+            LINKID_DataType = "Text",
+            INPID_InputControl = "TextEditControl",
+        })
+    end)
+    if not calOk then
+        InCalibFile = nil
+        LogFuse("CalibFile-Input nicht unterstuetzt — nur Auto-Suche")
+    end
+
     -- DRAG-STEUERUNG: Point-Control (Fadenkreuz im Viewer). Ziehen setzt
     -- Pan/Tilt. Mittelpunkt (0.5,0.5) = geradeaus.
-    InAim = self:AddInput("Aim", "Blickrichtung (im Viewer ziehen)", {
-        LINKID_DataType = "Point",
-        INPID_InputControl = "PointControl",
-        INP_Default = { 0.5, 0.5 },
-        INP_MinScale = 0.0,
-        INP_MaxScale = 1.0,
-        IC_ForceFloat = true,
-        IC_SuppressDot = false,
-        LINK_Main = 0,
-    })
+    -- ROBUST: pcall-gekapselt — falls diese Resolve-Version PointControl mit
+    -- Table-Default ablehnt (bad argument #3, Create brach ab), laedt der Fuse
+    -- trotzdem komplett und nur die Drag-Geste entfaellt.
+    local aimOk = pcall(function()
+        InAim = self:AddInput("Aim", "Blickrichtung (im Viewer ziehen)", {
+            LINKID_DataType = "Point",
+            INPID_InputControl = "PointControl",
+            INP_Default = { 0.5, 0.5 },
+        })
+    end)
+    if not aimOk then
+        InAim = nil
+        LogFuse("Aim-PointControl nicht unterstuetzt — Drag deaktiviert, Slider nutzen")
+    end
 
     InAspect = self:AddInput("Aspect", "Aspect Ratio", {
         LINKID_DataType = "Number",
@@ -356,20 +495,22 @@ function Process(req)
         -- X: 0..1 -> Pan -180..180 ; Y: 0..1 -> Tilt +90..-90 (Y-down).
         local pan = InPan:GetValue(req).Value
         local tilt = InTilt:GetValue(req).Value
-        local okA, aim = pcall(function() return InAim:GetValue(req) end)
-        if okA and aim then
-            local ax, ay = 0.5, 0.5
-            if type(aim) == "table" then
-                ax = aim.X or aim[1] or 0.5
-                ay = aim.Y or aim[2] or 0.5
-            else
-                local okX, xv = pcall(function() return aim.X end)
-                local okY, yv = pcall(function() return aim.Y end)
-                if okX and type(xv) == "number" then ax = xv end
-                if okY and type(yv) == "number" then ay = yv end
+        if InAim then
+            local okA, aim = pcall(function() return InAim:GetValue(req) end)
+            if okA and aim then
+                local ax, ay = 0.5, 0.5
+                if type(aim) == "table" then
+                    ax = aim.X or aim[1] or 0.5
+                    ay = aim.Y or aim[2] or 0.5
+                else
+                    local okX, xv = pcall(function() return aim.X end)
+                    local okY, yv = pcall(function() return aim.Y end)
+                    if okX and type(xv) == "number" then ax = xv end
+                    if okY and type(yv) == "number" then ay = yv end
+                end
+                pan  = (ax - 0.5) * 360.0
+                tilt = (0.5 - ay) * 180.0
             end
-            pan  = (ax - 0.5) * 360.0
-            tilt = (0.5 - ay) * 180.0
         end
 
         -- Zielbild wie im offiziellen GPU sample.fuse erzeugen.
@@ -402,18 +543,30 @@ function Process(req)
             return
         end
 
-        -- Auto-Kalibrierung: .calib neben Front-Clip laden (gecacht)
+        -- KALIBRIERUNG (Prioritaet):
+        -- 1) Expliziter CalibFile-Input (setzt das Import-Skript).
+        -- 2) Sonst Auto-Suche neben dem Front-Clip.
+        -- Robust: lesen nur wenn Pfad gesetzt ist; Datei ist ~1 KB, frisch
+        -- lesen ist billiger als ein fehlschlagender mtime-Cache in Clip-Comps.
         local calib = DEFAULT_CALIB
-        local calibPath = findCalibPath(self.Comp)
-        if calibPath and calibPath ~= calibCachePath then
-            local t = parseCalibFile(calibPath)
-            if t and next(t) then
-                calibCache = t
-                calibCachePath = calibPath
-                LogFuse("Kalibrierung geladen: " .. calibPath)
+        local calibPath = nil
+        local okCf = false
+        if InCalibFile then
+            local tv = textValue(InCalibFile, req)
+            if tv and tv ~= "" then
+                calibPath = tv
+                okCf = true
             end
         end
-        if calibCache then calib = calibCache end
+        if not calibPath then
+            calibPath = findCalibPath(req)
+        end
+        if calibPath and calibPath ~= "" then
+            local t = parseCalibFile(calibPath)
+            if t and next(t) then
+                calib = t
+            end
+        end
 
         local function cv(key, dflt)
             local v = calib[key]
@@ -474,6 +627,27 @@ function Process(req)
         paramblock.bm6 = cv("back_m6", DEFAULT_CALIB.bm6)
         paramblock.bm7 = cv("back_m7", DEFAULT_CALIB.bm7)
         paramblock.bm8 = cv("back_m8", DEFAULT_CALIB.bm8)
+        -- Naht-Feinabgleich (Grad -> Radiant): Slider liefern userdata mit .Value
+        -- (wie InPan/InTilt) — pcall-gesichert
+        local byawDeg, bpitchDeg = 0.0, 0.0
+        if InBackYaw then
+            local okY, yv = pcall(function() return InBackYaw:GetValue(req) end)
+            if okY and yv ~= nil then
+                local val = yv.Value
+                if val == nil then val = yv.value end
+                if type(val) == "number" then byawDeg = val end
+            end
+        end
+        if InBackPitch then
+            local okP, pv = pcall(function() return InBackPitch:GetValue(req) end)
+            if okP and pv ~= nil then
+                local val = pv.Value
+                if val == nil then val = pv.value end
+                if type(val) == "number" then bpitchDeg = val end
+            end
+        end
+        paramblock.byaw = byawDeg * 3.14159265358979 / 180.0
+        paramblock.bpitch = bpitchDeg * 3.14159265358979 / 180.0
         paramblock.insize[0]  = front.DataWindow:Width()
         paramblock.insize[1]  = front.DataWindow:Height()
         paramblock.outsize[0] = ow
