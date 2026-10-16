@@ -1,13 +1,22 @@
 -- @mcp-fuse name=InstaReframeX6 kind=dctl_kernel type=tool
--- InstaReframe X6: 360°-Reframe direkt aus den zwei Fisheye-Streams einer
--- Insta360 X6 (INSV-Streams 0+1). Mapping: exakte v360-dfisheye-Mathematik
--- (FFmpeg vf_v360.c, xyz_to_dfisheye), validiert an echtem X6-Material.
+-- InstaReframe X6 v2.0: 360°-Reframe direkt aus den zwei Fisheye-Streams einer
+-- Insta360 X6 (INSV-Streams 0+1). Mapping: echtes MEI-Modell mit der
+-- Linsenkalibrierung aus den .insv-Metadaten (xi, fx, 13 Distorsionskoeff).
+--
+-- v2.0-Neuerungen:
+--  * AUTO-KALIBRIERUNG: Liest eine .calib-Datei (tools/insv_calib.py erzeugt),
+--    die neben dem Front-Clip (lens1.mp4) liegt; sonst eingebaute Defaults.
+--    Caching: die Datei wird nur bei Pfad-Aenderung neu gelesen.
+--  * DRAG-STEUERUNG: "Aim" ist ein Point-Control (Fadenkreuz im Viewer) —
+--    Pan/Tilt per Maus ziehen statt nur ueber Slider.
+--  * Y-down-Konvention (Welt aufrecht, Roll 0), Back per 180°-Y-Strahlrotation
+--    (keine Pixel-Spiegelung) — alles offline verifiziert.
 -- Inputs:  Front = Stream 1 (vordere Linse, z>=0), Back = Stream 0 (hinten, z<0)
 
 FuRegisterClass("InstaReframeX6", CT_Tool, {
     REGS_Category = "Fuses\\Insta360",
     REGS_OpIconString = "X6R",
-    REGS_OpDescription = "Reframe aus 2 Insta360-X6-Fisheye-Streams (v360-Mapping)",
+    REGS_OpDescription = "Reframe aus 2 Insta360-X6-Fisheye-Streams (MEI-Kalibrierung, Auto)",
 })
 
 KernelParams = [[
@@ -15,18 +24,23 @@ KernelParams = [[
     float Pan;
     float Tilt;
     float Roll;
+    float fxi;  float ffx;  float ffy;  float fcx;  float fcy;
+    float fk1;  float fk2;  float fk3;  float fk4;
+    float fp1;  float fp2;
+    float fs1;  float fs2;  float fs3;  float fs4;
+    float bxi;  float bfx;  float bfy;  float bcx;  float bcy;
+    float bk1;  float bk2;  float bk3;  float bk4;
+    float bp1;  float bp2;
+    float bs1;  float bs2;  float bs3;  float bs4;
+    float fm0;  float fm1;  float fm2;  float fm3;  float fm4;
+    float fm5;  float fm6;  float fm7;  float fm8;
+    float bm0;  float bm1;  float bm2;  float bm3;  float bm4;
+    float bm5;  float bm6;  float bm7;  float bm8;
     int   insize[2];
     int   outsize[2];
 ]]
 
 KernelSource = [[
-// X6-Linsenkalibrierung (aus .insv INFO f111/f112, verifiziert an
-// VID_20260918_205557_00_014, Firmware v1.1.78):
-//   Front (Stream 1, z>=0): xi 2.45543, fx 3611.11, cx 1926.45, cy 1939.42
-//   Back  (Stream 0, z<0):  xi 2.45543, fx 3603.76, cx 1930.63, cy 1943.50
-// Sensor-Roll (~89.66°) wird NICHT angewendet (verifiziert: verschlechtert).
-// Back-Linse ist um 180° um Y gedreht montiert -> Strahl-Rotation statt Flip.
-
 __KERNEL__ void InstaReframeX6Kernel(__CONSTANTREF__ KernelParams *params,
                                      __TEXTURE2D__ src,
                                      __TEXTURE2D__ src2,
@@ -38,8 +52,8 @@ __KERNEL__ void InstaReframeX6Kernel(__CONSTANTREF__ KernelParams *params,
         const float PI = 3.14159265358979f;
 
         // Pixel -> Richtungsvektor. MEI-Kalibrierung arbeitet in Y-DOWN-
-        // Konvention (cy ist Bildzeile, v wächst nach unten): NUR x invertieren
-        // (Bild-x rechts => Sphäre +x), y NICHT negieren (Bild-y unten => +y).
+        // Konvention (cy ist Bildzeile, v waechst nach unten): NUR x invertieren
+        // (Bild-x rechts => Sphaere +x), y NICHT negieren (Bild-y unten => +y).
         float focal = (params->outsize[1] * 0.5f) / _tanf(params->FOV * 0.5f * PI / 180.0f);
         float dx = ((float)x - params->outsize[0] * 0.5f) / focal;
         float dy = ((float)y - params->outsize[1] * 0.5f) / focal;
@@ -78,29 +92,29 @@ __KERNEL__ void InstaReframeX6Kernel(__CONSTANTREF__ KernelParams *params,
         if (z3 >= 0.0f)
         {
             // ---- Front (Stream 1): extrinsisch nur yaw/pitch (klein) ----
-            // R_front.T @ ray (exakt aus .insv-Kalibrierung)
-            float Xl =  0.999973f*x3 + 0.00000f*y3 - 0.007295f*z3;
-            float Yl = -0.000023f*x3 + 0.999995f*y3 - 0.003142f*z3;
-            float Zl =  0.007295f*x3 + 0.003142f*y3 + 0.999968f*z3;
+            // R_front.T @ ray (Kalibrierung)
+            float Xl = params->fm0*x3 + params->fm1*y3 + params->fm2*z3;
+            float Yl = params->fm3*x3 + params->fm4*y3 + params->fm5*z3;
+            float Zl = params->fm6*x3 + params->fm7*y3 + params->fm8*z3;
             // MEI forward
             float norm = _sqrtf(Xl*Xl + Yl*Yl + Zl*Zl);
             if (norm > 1e-6f)
             {
                 float Xs = Xl / norm, Ys = Yl / norm, Zs = Zl / norm;
-                float denom = Zs + 2.45543f;
+                float denom = Zs + params->fxi;
                 if (denom > 1e-4f)
                 {
                     float mx = Xs / denom;
                     float my = Ys / denom;
                     float r2 = mx*mx + my*my;
                     float r4 = r2*r2;
-                    float radial = 1.0f + 1.31325f*r2 - 1.59305f*r4 + 6.99536f*r2*r4 - 2.58052f*r4*r4;
-                    float xd = mx*radial + 2.0f*(-0.00102256f)*mx*my - 0.00163018f*(r2 + 2.0f*mx*mx) - 0.00392101f*r2 + 0.0146974f*r4;
-                    float yd = my*radial - 0.00102256f*(r2 + 2.0f*my*my) + 2.0f*(-0.00163018f)*mx*my + 0.00406541f*r2 + 0.00244077f*r4;
-                    u = 3611.11f*xd + 1926.45f;
-                    v = 3611.11f*yd + 1939.42f;
+                    float radial = 1.0f + params->fk1*r2 + params->fk2*r4 + params->fk3*r2*r4 + params->fk4*r4*r4;
+                    float xd = mx*radial + 2.0f*params->fp1*mx*my + params->fp2*(r2 + 2.0f*mx*mx) + params->fs1*r2 + params->fs2*r4;
+                    float yd = my*radial + params->fp1*(r2 + 2.0f*my*my) + 2.0f*params->fp2*mx*my + params->fs3*r2 + params->fs4*r4;
+                    u = params->ffx*xd + params->fcx;
+                    v = params->ffy*yd + params->fcy;
                     float rmax = (iw < ih ? iw : ih) * 0.5f * 0.97f;
-                    float du = u - 1926.45f, dv = v - 1939.42f;
+                    float du = u - params->fcx, dv = v - params->fcy;
                     if (_sqrtf(du*du + dv*dv) <= rmax && u >= 0.0f && u <= iw - 1.0f && v >= 0.0f && v <= ih - 1.0f)
                     {
                         ok = 1;
@@ -115,29 +129,29 @@ __KERNEL__ void InstaReframeX6Kernel(__CONSTANTREF__ KernelParams *params,
         else
         {
             // ---- Back (Stream 0): 180°-Y-Rotation (x,z -> -x,-z) + klein ----
-            // R_back.T @ ray (exakt aus .insv-Kalibrierung)
-            float Xl = -0.999986f*x3 + 0.00000f*y3 - 0.005288f*z3;
-            float Yl = -0.000016f*x3 + 0.999995f*y3 + 0.003107f*z3;
-            float Zl =  0.005288f*x3 + 0.003107f*y3 - 0.999981f*z3;
+            // R_back.T @ ray (Kalibrierung)
+            float Xl = params->bm0*x3 + params->bm1*y3 + params->bm2*z3;
+            float Yl = params->bm3*x3 + params->bm4*y3 + params->bm5*z3;
+            float Zl = params->bm6*x3 + params->bm7*y3 + params->bm8*z3;
             // MEI forward
             float norm = _sqrtf(Xl*Xl + Yl*Yl + Zl*Zl);
             if (norm > 1e-6f)
             {
                 float Xs = Xl / norm, Ys = Yl / norm, Zs = Zl / norm;
-                float denom = Zs + 2.45543f;
+                float denom = Zs + params->bxi;
                 if (denom > 1e-4f)
                 {
                     float mx = Xs / denom;
                     float my = Ys / denom;
                     float r2 = mx*mx + my*my;
                     float r4 = r2*r2;
-                    float radial = 1.0f + 1.27913f*r2 - 0.752754f*r4 + 0.472147f*r2*r4 + 15.4547f*r4*r4;
-                    float xd = mx*radial + 2.0f*0.00126113f*mx*my + 0.00033189f*(r2 + 2.0f*mx*mx) - 0.0065367f*r2 + 0.0131532f*r4;
-                    float yd = my*radial + 0.00126113f*(r2 + 2.0f*my*my) + 2.0f*0.00033189f*mx*my - 0.00036284f*r2 - 0.00159663f*r4;
-                    u = 3603.76f*xd + 1930.63f;
-                    v = 3603.76f*yd + 1943.50f;
+                    float radial = 1.0f + params->bk1*r2 + params->bk2*r4 + params->bk3*r2*r4 + params->bk4*r4*r4;
+                    float xd = mx*radial + 2.0f*params->bp1*mx*my + params->bp2*(r2 + 2.0f*mx*mx) + params->bs1*r2 + params->bs2*r4;
+                    float yd = my*radial + params->bp1*(r2 + 2.0f*my*my) + 2.0f*params->bp2*mx*my + params->bs3*r2 + params->bs4*r4;
+                    u = params->bfx*xd + params->bcx;
+                    v = params->bfy*yd + params->bcy;
                     float rmax = (iw < ih ? iw : ih) * 0.5f * 0.97f;
-                    float du = u - 1930.63f, dv = v - 1943.50f;
+                    float du = u - params->bcx, dv = v - params->bcy;
                     if (_sqrtf(du*du + dv*dv) <= rmax && u >= 0.0f && u <= iw - 1.0f && v >= 0.0f && v <= ih - 1.0f)
                     {
                         ok = 1;
@@ -152,6 +166,63 @@ __KERNEL__ void InstaReframeX6Kernel(__CONSTANTREF__ KernelParams *params,
     }
 }
 ]]
+
+-- Eingebaute Default-Kalibrierung (verifizierte X6, VID_20260918_205557_00_014)
+local DEFAULT_CALIB = {
+    fxi=2.45543, ffx=3611.11, ffy=3611.11, fcx=1926.45, fcy=1939.42,
+    fk1=1.31325, fk2=-1.59305, fk3=6.99536, fk4=-2.58052,
+    fp1=-0.00102256, fp2=-0.00163018,
+    fs1=-0.00392101, fs2=0.0146974, fs3=0.00406541, fs4=0.00244077,
+    bxi=2.45543, bfx=3603.76, bfy=3603.76, bcx=1930.63, bcy=1943.50,
+    bk1=1.27913, bk2=-0.752754, bk3=0.472147, bk4=15.4547,
+    bp1=0.00126113, bp2=0.00033189,
+    bs1=-0.0065367, bs2=0.0131532, bs3=-0.00036284, bs4=-0.00159663,
+    fm0=0.999973, fm1=0.0, fm2=-0.007295, fm3=-0.000023, fm4=0.999995,
+    fm5=-0.003142, fm6=0.007295, fm7=0.003142, fm8=0.999968,
+    bm0=-0.999986, bm1=0.0, bm2=-0.005288, bm3=-0.000016, bm4=0.999995,
+    bm5=0.003107, bm6=0.005288, bm7=0.003107, bm8=-0.999981,
+}
+
+-- Cache fuer Auto-Kalibrierung (Datei nur bei Pfad-Aenderung neu lesen)
+local calibCache = nil
+local calibCachePath = nil
+
+local function parseCalibFile(path)
+    local okF, f = pcall(function() return io.open(path, "r") end)
+    if not okF or not f then return nil end
+    local t = {}
+    for line in f:lines() do
+        line = line:gsub("%s+$", "")
+        local k, v = line:match("^([%w_]+)=(%-?[%d%.eE]+)$")
+        if k and v then
+            local n = tonumber(v)
+            if n then t[k] = n end
+        end
+    end
+    f:close()
+    return t
+end
+
+-- Findet .calib automatisch: gleicher Basisname wie der Front-Clip.
+local function findCalibPath(comp)
+    if not comp then return nil end
+    for i, t in pairs(comp:GetToolList(false)) do
+        local name = t:GetAttrs().TOOLS_Name
+        if name == "MediaIn1" then
+            local clip = t:GetAttrs().TOOLS_Clip_Path
+            if clip and clip ~= "" then
+                local base = clip:match("^(.*)%.[%w]+$") or clip
+                local cand = base .. ".calib"
+                local okF, f = pcall(function() return io.open(cand, "r") end)
+                if okF and f then
+                    f:close()
+                    return cand
+                end
+            end
+        end
+    end
+    return nil
+end
 
 function Create()
     InFOV = self:AddInput("FOV", "FOV", {
@@ -186,6 +257,34 @@ function Create()
         INP_MaxScale = 180.0,
     })
 
+    -- DRAG-STEUERUNG: Point-Control (Fadenkreuz im Viewer). Ziehen setzt
+    -- Pan/Tilt. Mittelpunkt (0.5,0.5) = geradeaus.
+    InAim = self:AddInput("Aim", "Blickrichtung (im Viewer ziehen)", {
+        LINKID_DataType = "Point",
+        INPID_InputControl = "PointControl",
+        INP_Default = { 0.5, 0.5 },
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+        IC_ForceFloat = true,
+        IC_SuppressDot = false,
+        LINK_Main = 0,
+    })
+
+    InAspect = self:AddInput("Aspect", "Aspect Ratio", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_Default = 0,
+        { CCS_AddString = "4K UHD (3840x2160)" },
+        { CCS_AddString = "16:9 (1920x1080)" },
+        { CCS_AddString = "9:16 (1080x1920)" },
+        { CCS_AddString = "1:1 (1080x1080)" },
+        { CCS_AddString = "4:5 (1080x1350)" },
+        { CCS_AddString = "9:21 (1080x2520)" },
+        { CCS_AddString = "Custom" },
+        CC_LabelPosition = "Horizontal",
+    })
+
     InOutW = self:AddInput("OutWidth", "Output Breite", {
         LINKID_DataType = "Number",
         INPID_InputControl = "SliderControl",
@@ -200,22 +299,6 @@ function Create()
         INP_Default = 1080.0,
         INP_MinScale = 16.0,
         INP_MaxScale = 4320.0,
-    })
-
-    -- Aspect-Preset: steuert OutWidth/OutHeight bequem
-    InAspect = self:AddInput("Aspect", "Aspect Ratio", {
-        LINKID_DataType = "Number",
-        INPID_InputControl = "ComboControl",
-        INP_Integer = true,
-        INP_Default = 0,
-        { CCS_AddString = "4K UHD (3840x2160)" },
-        { CCS_AddString = "16:9 (1920x1080)" },
-        { CCS_AddString = "9:16 (1080x1920)" },
-        { CCS_AddString = "1:1 (1080x1080)" },
-        { CCS_AddString = "4:5 (1080x1350)" },
-        { CCS_AddString = "9:21 (1080x2520)" },
-        { CCS_AddString = "Custom" },
-        CC_LabelPosition = "Horizontal",
     })
 
     InFront = self:AddInput("Front", "Front", {
@@ -247,11 +330,7 @@ function Process(req)
         local ow = math.floor(InOutW:GetValue(req).Value + 0.5)
         local oh = math.floor(InOutH:GetValue(req).Value + 0.5)
 
-        -- Aspect-Preset ueberschreibt OutWidth/OutHeight (Custom = Slider-Werte)
-        -- ComboControl: 0-basiert (0=4K ... 5=9:21, 6=Custom).
-        -- GetValue(req) kann Zahl, table ODER userdata (struct Number)
-        -- liefern -> pcall-gesichert auf .Value zugreifen, nie vergleichen
-        -- ohne Konvertierung (Struct-Vergleich crasht sonst den Process).
+        -- Aspect-Preset (0-basiert: 0=4K ... 5=9:21, 6=Custom). pcall-gesichert.
         local aspect = -1
         local okR, av = pcall(function() return InAspect:GetValue(req) end)
         if okR then
@@ -273,9 +352,27 @@ function Process(req)
         ow = math.max(16, math.min(7680, ow))
         oh = math.max(16, math.min(4320, oh))
 
-        -- Zielbild wie im offiziellen GPU sample.fuse erzeugen: EXPLIZITE
-        -- Groessen-Attribute + IMG_Document; erst daraus das out-Image ableiten.
-        -- (Image({IMG_Like = front, ...}) erbt das 3840er-Format des Eingangs!)
+        -- DRAG: Aim-Point (0..1) -> Pan/Tilt. Mittelpunkt = geradeaus.
+        -- X: 0..1 -> Pan -180..180 ; Y: 0..1 -> Tilt +90..-90 (Y-down).
+        local pan = InPan:GetValue(req).Value
+        local tilt = InTilt:GetValue(req).Value
+        local okA, aim = pcall(function() return InAim:GetValue(req) end)
+        if okA and aim then
+            local ax, ay = 0.5, 0.5
+            if type(aim) == "table" then
+                ax = aim.X or aim[1] or 0.5
+                ay = aim.Y or aim[2] or 0.5
+            else
+                local okX, xv = pcall(function() return aim.X end)
+                local okY, yv = pcall(function() return aim.Y end)
+                if okX and type(xv) == "number" then ax = xv end
+                if okY and type(yv) == "number" then ay = yv end
+            end
+            pan  = (ax - 0.5) * 360.0
+            tilt = (0.5 - ay) * 180.0
+        end
+
+        -- Zielbild wie im offiziellen GPU sample.fuse erzeugen.
         local xa, ya = 1, 1
         if front.XAspectX and front.XAspectX ~= 0 then
             xa = front.XAspectX
@@ -305,11 +402,78 @@ function Process(req)
             return
         end
 
+        -- Auto-Kalibrierung: .calib neben Front-Clip laden (gecacht)
+        local calib = DEFAULT_CALIB
+        local calibPath = findCalibPath(self.Comp)
+        if calibPath and calibPath ~= calibCachePath then
+            local t = parseCalibFile(calibPath)
+            if t and next(t) then
+                calibCache = t
+                calibCachePath = calibPath
+                LogFuse("Kalibrierung geladen: " .. calibPath)
+            end
+        end
+        if calibCache then calib = calibCache end
+
+        local function cv(key, dflt)
+            local v = calib[key]
+            if v == nil then return dflt end
+            return v
+        end
+
         local paramblock = node:GetParamBlock(KernelParams)
         paramblock.FOV    = InFOV:GetValue(req).Value
-        paramblock.Pan    = InPan:GetValue(req).Value
-        paramblock.Tilt   = InTilt:GetValue(req).Value
+        paramblock.Pan    = pan
+        paramblock.Tilt   = tilt
         paramblock.Roll   = InRoll:GetValue(req).Value
+        paramblock.fxi = cv("front_xi", DEFAULT_CALIB.fxi)
+        paramblock.ffx = cv("front_fx", DEFAULT_CALIB.ffx)
+        paramblock.ffy = cv("front_fy", DEFAULT_CALIB.ffy)
+        paramblock.fcx = cv("front_cx", DEFAULT_CALIB.fcx)
+        paramblock.fcy = cv("front_cy", DEFAULT_CALIB.fcy)
+        paramblock.fk1 = cv("front_k1", DEFAULT_CALIB.fk1)
+        paramblock.fk2 = cv("front_k2", DEFAULT_CALIB.fk2)
+        paramblock.fk3 = cv("front_k3", DEFAULT_CALIB.fk3)
+        paramblock.fk4 = cv("front_k4", DEFAULT_CALIB.fk4)
+        paramblock.fp1 = cv("front_p1", DEFAULT_CALIB.fp1)
+        paramblock.fp2 = cv("front_p2", DEFAULT_CALIB.fp2)
+        paramblock.fs1 = cv("front_s1", DEFAULT_CALIB.fs1)
+        paramblock.fs2 = cv("front_s2", DEFAULT_CALIB.fs2)
+        paramblock.fs3 = cv("front_s3", DEFAULT_CALIB.fs3)
+        paramblock.fs4 = cv("front_s4", DEFAULT_CALIB.fs4)
+        paramblock.bxi = cv("back_xi", DEFAULT_CALIB.bxi)
+        paramblock.bfx = cv("back_fx", DEFAULT_CALIB.bfx)
+        paramblock.bfy = cv("back_fy", DEFAULT_CALIB.bfy)
+        paramblock.bcx = cv("back_cx", DEFAULT_CALIB.bcx)
+        paramblock.bcy = cv("back_cy", DEFAULT_CALIB.bcy)
+        paramblock.bk1 = cv("back_k1", DEFAULT_CALIB.bk1)
+        paramblock.bk2 = cv("back_k2", DEFAULT_CALIB.bk2)
+        paramblock.bk3 = cv("back_k3", DEFAULT_CALIB.bk3)
+        paramblock.bk4 = cv("back_k4", DEFAULT_CALIB.bk4)
+        paramblock.bp1 = cv("back_p1", DEFAULT_CALIB.bp1)
+        paramblock.bp2 = cv("back_p2", DEFAULT_CALIB.bp2)
+        paramblock.bs1 = cv("back_s1", DEFAULT_CALIB.bs1)
+        paramblock.bs2 = cv("back_s2", DEFAULT_CALIB.bs2)
+        paramblock.bs3 = cv("back_s3", DEFAULT_CALIB.bs3)
+        paramblock.bs4 = cv("back_s4", DEFAULT_CALIB.bs4)
+        paramblock.fm0 = cv("front_m0", DEFAULT_CALIB.fm0)
+        paramblock.fm1 = cv("front_m1", DEFAULT_CALIB.fm1)
+        paramblock.fm2 = cv("front_m2", DEFAULT_CALIB.fm2)
+        paramblock.fm3 = cv("front_m3", DEFAULT_CALIB.fm3)
+        paramblock.fm4 = cv("front_m4", DEFAULT_CALIB.fm4)
+        paramblock.fm5 = cv("front_m5", DEFAULT_CALIB.fm5)
+        paramblock.fm6 = cv("front_m6", DEFAULT_CALIB.fm6)
+        paramblock.fm7 = cv("front_m7", DEFAULT_CALIB.fm7)
+        paramblock.fm8 = cv("front_m8", DEFAULT_CALIB.fm8)
+        paramblock.bm0 = cv("back_m0", DEFAULT_CALIB.bm0)
+        paramblock.bm1 = cv("back_m1", DEFAULT_CALIB.bm1)
+        paramblock.bm2 = cv("back_m2", DEFAULT_CALIB.bm2)
+        paramblock.bm3 = cv("back_m3", DEFAULT_CALIB.bm3)
+        paramblock.bm4 = cv("back_m4", DEFAULT_CALIB.bm4)
+        paramblock.bm5 = cv("back_m5", DEFAULT_CALIB.bm5)
+        paramblock.bm6 = cv("back_m6", DEFAULT_CALIB.bm6)
+        paramblock.bm7 = cv("back_m7", DEFAULT_CALIB.bm7)
+        paramblock.bm8 = cv("back_m8", DEFAULT_CALIB.bm8)
         paramblock.insize[0]  = front.DataWindow:Width()
         paramblock.insize[1]  = front.DataWindow:Height()
         paramblock.outsize[0] = ow
