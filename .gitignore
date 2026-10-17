@@ -9,3 +9,5 @@ test/
 __pycache__/
 *.drp
 fuse_log.txt
+scratch_test/
+InstaReframeX6-v2.1.zip
