@@ -312,9 +312,16 @@ public:
     void render(const RenderArguments &args) override {
         std::string calibPath;
         calib_->getValue(calibPath);
+        // animated params must be sampled AT THE RENDER TIME (keyframes)
+        double fov, pan, tilt, roll, byaw, bpitch;
+        fov_->getValueAtTime(args.time, fov);
+        pan_->getValueAtTime(args.time, pan);
+        tilt_->getValueAtTime(args.time, tilt);
+        roll_->getValueAtTime(args.time, roll);
+        byaw_->getValueAtTime(args.time, byaw);
+        bpitch_->getValueAtTime(args.time, bpitch);
         plog("render t=%.3f fov=%.2f pan=%.2f tilt=%.2f roll=%.2f calib=%s\n",
-             args.time, fov_->getValue(), pan_->getValue(),
-             tilt_->getValue(), roll_->getValue(), calibPath.c_str());
+             args.time, fov, pan, tilt, roll, calibPath.c_str());
 
         Calib calib = loadCalib(calibPath);
 
@@ -324,9 +331,8 @@ public:
         proc.setDstImg(dst.get());
         proc.setSrcImg(src.get());
         proc.setCalib(calib);
-        proc.setAngles((float)fov_->getValue(), (float)pan_->getValue(),
-                       (float)tilt_->getValue(), (float)roll_->getValue(),
-                       (float)byaw_->getValue(), (float)bpitch_->getValue());
+        proc.setAngles((float)fov, (float)pan, (float)tilt, (float)roll,
+                       (float)byaw, (float)bpitch);
         proc.setRenderWindow(args.renderWindow);
         clock_t tc0 = clock();
         proc.process();
@@ -374,7 +380,7 @@ void ReframeFactory::describeInContext(ImageEffectDescriptor &desc, ContextEnum 
     p = desc.defineDoubleParam("FOV");
     p->setLabel("Field of View (deg)");
     p->setRange(10.0, 170.0);
-    p->setDefault(60.0);
+    p->setDefault(90.0);
     p->setIncrement(1.0);
     p->setParent(*group);
 
