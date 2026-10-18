@@ -10,6 +10,9 @@
 #include <cstring>
 #include <cstdio>
 #include <cmath>
+#include <atomic>
+#include <thread>
+#include <vector>
 #include <string>
 #include <fstream>
 #include "ofxsImageEffect.h"
@@ -21,7 +24,7 @@ using namespace OFX;
 static const float PI = 3.14159265358979f;
 static const char *LOGPATH = "C:/Users/stefa/AppData/Local/Temp/reframe_ofx.log";
 
-static void logf(const char *fmt, double t, double a, double b, double c, double d, const char *s) {
+static void plog(const char *fmt, double t, double a, double b, double c, double d, const char *s) {
     FILE *f = fopen(LOGPATH, "a");
     if (f) { fprintf(f, fmt, t, a, b, c, d, s); fclose(f); }
 }
@@ -183,7 +186,7 @@ public:
         float ct = std::cos(_tilt * PI / 180.0f), st = std::sin(_tilt * PI / 180.0f);
         float cp = std::cos(_pan * PI / 180.0f), sp = std::sin(_pan * PI / 180.0f);
         float rmax = std::min(halfW, (float)srcH) * 0.5f * 0.97f;
-        long written = 0, skipped = 0;
+        std::atomic<long> written{0}, skipped{0};
         static long lastlog = 0;
         if (++lastlog <= 3) {
             FILE *f = fopen("C:/Users/stefa/AppData/Local/Temp/reframe_ofx.log", "a");
@@ -192,7 +195,8 @@ public:
                 (int)_srcImg->getRowBytes(), procWindow.x1, procWindow.y1, procWindow.x2, procWindow.y2); fclose(f); }
         }
 
-        for (int y = procWindow.y1; y < procWindow.y2; y++) {
+        auto warpRows = [&](int ya, int yb) {
+        for (int y = ya; y < yb; y++) {
             if (_effect.abort()) break;
             for (int x = procWindow.x1; x < procWindow.x2; x++) {
                 // direction ray (y-down convention, same as verified kernel)
@@ -268,9 +272,21 @@ public:
                 written++;
             }
         }
+        };
+        int nrows = procWindow.y2 - procWindow.y1;
+        int nt = (int)std::thread::hardware_concurrency();
+        if (nt > nrows) nt = nrows;
+        if (nt < 1) nt = 1;
+        std::vector<std::thread> th;
+        for (int t = 0; t < nt; t++) {
+            int ya = procWindow.y1 + nrows * t / nt;
+            int yb = procWindow.y1 + nrows * (t + 1) / nt;
+            th.emplace_back([&, ya, yb]() { warpRows(ya, yb); });
+        }
+        for (auto &x : th) x.join();
         if (lastlog <= 3) {
             FILE *f = fopen("C:/Users/stefa/AppData/Local/Temp/reframe_ofx.log", "a");
-            if (f) { fprintf(f, "stats written=%ld skipped=%ld\n", written, skipped); fclose(f); }
+            if (f) { fprintf(f, "stats written=%ld skipped=%ld\n", written.load(), skipped.load()); fclose(f); }
         }
     }
 };
@@ -296,7 +312,7 @@ public:
     void render(const RenderArguments &args) override {
         std::string calibPath;
         calib_->getValue(calibPath);
-        logf("render t=%.3f fov=%.2f pan=%.2f tilt=%.2f roll=%.2f calib=%s\n",
+        plog("render t=%.3f fov=%.2f pan=%.2f tilt=%.2f roll=%.2f calib=%s\n",
              args.time, fov_->getValue(), pan_->getValue(),
              tilt_->getValue(), roll_->getValue(), calibPath.c_str());
 
@@ -312,7 +328,11 @@ public:
                        (float)tilt_->getValue(), (float)roll_->getValue(),
                        (float)byaw_->getValue(), (float)bpitch_->getValue());
         proc.setRenderWindow(args.renderWindow);
+        clock_t tc0 = clock();
         proc.process();
+        { FILE *f = fopen(LOGPATH, "a");
+          if (f) { fprintf(f, "render done t=%.3f in %.1f ms\n", args.time,
+                  1000.0 * (clock() - tc0) / CLOCKS_PER_SEC); fclose(f); } }
     }
 };
 
