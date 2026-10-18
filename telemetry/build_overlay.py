@@ -301,6 +301,7 @@ if __name__ == "__main__":
     ap.add_argument("--width", type=int, default=1080)
     ap.add_argument("--height", type=int, default=1920)
     ap.add_argument("--tz", type=int, default=2, help="camera-local -> UTC offset hours")
+    ap.add_argument("--start", default=None, help="clip start 'YYYYMMDD_HHMMSS' (camera local) if filename lacks it")
     ap.add_argument("--frames", type=int, default=None)
     ap.add_argument("--out", default=None)
     ap.add_argument("--timeline", action="store_true")
@@ -319,6 +320,11 @@ if __name__ == "__main__":
         sys.exit("no sidecar .gpx found next to clip")
 
     start_local = clip_start_from_name(os.path.basename(a.clip))
+    if start_local is None and a.start:
+        s = a.start.replace("_", "")
+        d, t = s[:8], s[8:14]
+        start_local = dt.datetime(int(d[0:4]), int(d[4:6]), int(d[6:8]),
+                                  int(t[0:2]), int(t[2:4]), int(t[4:6]))
     if not start_local:
         sys.exit("cannot parse start time from clip filename")
     start_ts = (start_local - dt.timedelta(hours=a.tz)).replace(tzinfo=dt.timezone.utc).timestamp()
