@@ -114,7 +114,44 @@ def trail_polyline(pts, t, window=120, scale=1.0):
             out.append((dlat*111320.0*scale, dlon*111320.0*math.cos(math.radians(ref[1]))*scale))
     return out
 
-def render(ms, pts, start_ts, fps, frames, width, height, layout, outdir):
+def pan_from_spec(spec, t):
+    """spec: list of (t, pan) keyframes, linear interp, wrap 360"""
+    if not spec: return 0.0
+    if t <= spec[0][0]: return spec[0][1]
+    if t >= spec[-1][0]: return spec[-1][1]
+    lo, hi = 0, len(spec)-1
+    while hi - lo > 1:
+        mid = (lo+hi)//2
+        if spec[mid][0] <= t: lo = mid
+        else: hi = mid
+    a, b = spec[lo], spec[hi]
+    f = (t - a[0]) / (b[0] - a[0])
+    return (a[1] + f*(b[1] - a[1])) % 360
+
+def parse_pan_log(path):
+    """Extract pan(t) from OFX render log lines 'render t=... pan=...'"""
+    spec = []
+    for line in open(path, encoding="utf-8", errors="ignore"):
+        m = re.search(r"render t=([\d.]+).*?pan=([-\d.]+)", line)
+        if m: spec.append((float(m.group(1)), float(m.group(2))))
+    spec.sort()
+    # dedupe consecutive identical t
+    out = []
+    for t, p in spec:
+        if out and abs(out[-1][0] - t) < 1e-6: out[-1] = (t, p)
+        else: out.append((t, p))
+    return out
+
+def parse_pan(s):
+    """'0:0,59:180' -> [(0,0),(59,180)]"""
+    out = []
+    for part in s.split(","):
+        t, p = part.split(":")
+        out.append((float(t), float(p)))
+    out.sort()
+    return out
+
+def render(ms, pts, start_ts, fps, frames, width, height, layout, outdir, pan_spec=None):
     from PIL import Image, ImageDraw, ImageFont
     font_path = "C:/Windows/Fonts/segoeui.ttf"
     if not os.path.exists(font_path): font_path = "C:/Windows/Fonts/arial.ttf"
@@ -125,25 +162,96 @@ def render(ms, pts, start_ts, fps, frames, width, height, layout, outdir):
     for i in range(frames):
         t = start_ts + i/fps
         _, sp, hd, ele, dist = interpolate(ms, t)
+        pan = pan_from_spec(pan_spec, t - start_ts) if pan_spec else 0.0
         img = Image.new("RGBA", (width, height), (0,0,0,0))
-        d = ImageDraw.Draw(img)
-        x = int(width*0.06); y = int(height*0.82)
-        d.text((x, y), f"{sp*3.6:.1f} km/h", font=font, fill=(255,255,255,230))
-        if layout in ("full",):
-            d.text((x, y+fs_big+8), f"{ele:.0f} m  {dist/1000:.2f} km", font=font2, fill=(200,200,200,200))
-        # compass
-        cx = int(width*0.88); cy = int(height*0.87); r = int(width*0.08)
-        a = math.radians(hd-90)
-        d.ellipse((cx-r, cy-r, cx+r, cy+r), outline=(255,255,255,160), width=max(2,int(width/270)))
-        d.line((cx, cy, cx+r*math.cos(a), cy+r*math.sin(a)), fill=(255,255,255,230), width=max(3,int(width/180)))
-        if layout in ("full", "map"):
-            # trail minimap top-right
-            mcx = int(width*0.85); mcy = int(height*0.12); sc = width/600.0
-            poly = trail_polyline(pts, t, window=120, scale=sc)
-            if len(poly) > 1:
-                d.line([(mcx+px, mcy-py) for px, py in poly], fill=(255,255,255,140), width=max(2,int(width/300)))
-                d.ellipse((mcx-4, mcy-4, mcx+4, mcy+4), fill=(255,80,80,230))
+        if layout == "holo":
+            render_holo(img, width, height, sp, hd, ele, dist, pan, pts, t, font, font2)
+        else:
+            d = ImageDraw.Draw(img)
+            x = int(width*0.06); y = int(height*0.82)
+            d.text((x, y), f"{sp*3.6:.1f} km/h", font=font, fill=(255,255,255,230))
+            if layout in ("full",):
+                d.text((x, y+fs_big+8), f"{ele:.0f} m  {dist/1000:.2f} km", font=font2, fill=(200,200,200,200))
+            cx = int(width*0.88); cy = int(height*0.87); r = int(width*0.08)
+            a = math.radians(hd-90)
+            d.ellipse((cx-r, cy-r, cx+r, cy+r), outline=(255,255,255,160), width=max(2,int(width/270)))
+            d.line((cx, cy, cx+r*math.cos(a), cy+r*math.sin(a)), fill=(255,255,255,230), width=max(3,int(width/180)))
+            if layout in ("full", "map"):
+                mcx = int(width*0.85); mcy = int(height*0.12); sc = width/600.0
+                poly = trail_polyline(pts, t, window=120, scale=sc)
+                if len(poly) > 1:
+                    d.line([(mcx+px, mcy-py) for px, py in poly], fill=(255,255,255,140), width=max(2,int(width/300)))
+                    d.ellipse((mcx-4, mcy-4, mcx+4, mcy+4), fill=(255,80,80,230))
         img.save(os.path.join(outdir, f"f{i:06d}.png"))
+
+def render_holo(img, width, height, sp, hd, ele, dist, pan, pts, t, font, font2):
+    """Holographic dashboard anchored to world orientation:
+    ring of cardinal directions rotates with pan, trail minimap heading-up,
+    glowing cyan strokes, corner brackets."""
+    from PIL import Image, ImageDraw, ImageFilter
+    glow = Image.new("RGBA", (width, height), (0,0,0,0))
+    sharp = Image.new("RGBA", (width, height), (0,0,0,0))
+    dg = ImageDraw.Draw(glow)
+    ds = ImageDraw.Draw(sharp)
+    cyan = (0, 220, 255, 200)
+    white = (235, 250, 255, 235)
+    lw = max(2, width//300)
+
+    # --- compass ring, center bottom, rotates so world bearing b appears at screen angle b-pan
+    cx = width/2.0; cy = height*0.80; R = width*0.32
+    for b in range(0, 360, 15):
+        a = math.radians(b - pan - 90)
+        r1 = R*(0.92 if b % 45 else 0.86)
+        x1 = cx + r1*math.cos(a); y1 = cy + r1*math.sin(a)
+        x2 = cx + R*math.cos(a); y2 = cy + R*math.sin(a)
+        ds.line((x1, y1, x2, y2), fill=cyan, width=lw)
+    # ring circle
+    ds.ellipse((cx-R, cy-R, cx+R, cy+R), outline=cyan, width=lw)
+    # cardinal labels N/E/S/W
+    for b, lab in ((0,"N"),(90,"O"),(180,"S"),(270,"W")):
+        a = math.radians(b - pan - 90)
+        lx = cx + R*1.10*math.cos(a); ly = cy + R*1.10*math.sin(a)
+        ds.text((lx-10, ly-14), lab, font=font2, fill=white)
+    # heading pointer (travel direction)
+    a = math.radians(hd - pan - 90)
+    ds.line((cx, cy, cx + R*0.8*math.cos(a), cy + R*0.8*math.sin(a)), fill=(255,90,90,230), width=max(3, width//180))
+    ds.ellipse((cx-3, cy-3, cx+3, cy+3), fill=white)
+
+    # --- speed text, center, glowing
+    txt = f"{sp*3.6:.1f} km/h"
+    tb = ds.textbbox((0,0), txt, font=font)
+    tw = tb[2]-tb[0]
+    tx = (width-tw)/2; ty = height*0.62
+    ds.text((tx, ty), txt, font=font, fill=white)
+    dg.text((tx, ty), txt, font=font, fill=cyan)
+    # data line under speed
+    sub = f"{ele:.0f} m  {dist/1000:.2f} km  {hd:.0f}°"
+    tb2 = ds.textbbox((0,0), sub, font=font2)
+    sx = (width-(tb2[2]-tb2[0]))/2
+    ds.text((sx, ty+int(height*0.045)+10), sub, font=font2, fill=(180,230,255,210))
+    dg.text((sx, ty+int(height*0.045)+10), sub, font=font2, fill=cyan)
+
+    # --- trail minimap, heading-up (rotate trail by -hd), top center
+    mcx = width/2; mcy = height*0.14; sc = width/900.0
+    poly = trail_polyline(pts, t, window=120, scale=sc)
+    if len(poly) > 1:
+        ca, sa = math.cos(math.radians(-hd)), math.sin(math.radians(-hd))
+        rot = [(mcx + px*ca - py*sa, mcy + px*sa + py*ca) for px, py in poly]
+        ds.line(rot, fill=(0, 220, 255, 150), width=lw)
+        ddot = 4
+        ds.ellipse((mcx-ddot, mcy-ddot, mcx+ddot, mcy+ddot), fill=(255,90,90,230))
+    # corner brackets
+    m = width*0.06
+    for (x1, y1, x2, y2) in [(m, m, m+width*0.10, m), (m, m, m, m+height*0.05),
+                             (width-m, m, width-m, m+height*0.05), (width-m, m, width-m-10, m),
+                             (m, height-m, m+width*0.10, height-m), (m, height-m, m, height-m-height*0.05),
+                             (width-m, height-m, width-m, height-m-height*0.05), (width-m, height-m, width-m-10, height-m)]:
+        ds.line((x1, y1, x2, y2), fill=cyan, width=lw)
+
+    glow = glow.filter(ImageFilter.GaussianBlur(width//60))
+    img.alpha_composite(glow)
+    img.alpha_composite(sharp)
+
 
 def encode(outdir, fps, out_mov):
     subprocess.run([FFMPEG,"-y","-hide_banner","-loglevel","error","-framerate",str(fps),
@@ -180,7 +288,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--clip", required=True)
     ap.add_argument("--gpx", default=None)
-    ap.add_argument("--layout", default="full", choices=["minimal","full","map"])
+    ap.add_argument("--layout", default="full", choices=["minimal","full","map","holo"])
+    ap.add_argument("--pan", default=None, help="pan keyframes 't:deg,t:deg' matching OFX PAN keyframes")
+    ap.add_argument("--pan-log", default=None, help="OFX render log (reframe_ofx.log) — reads pan(t) directly from the plugin")
     ap.add_argument("--width", type=int, default=1080)
     ap.add_argument("--height", type=int, default=1920)
     ap.add_argument("--tz", type=int, default=2, help="camera-local -> UTC offset hours")
@@ -215,8 +325,9 @@ if __name__ == "__main__":
     json.dump({"fps": fps, "start_utc": start_ts, "clip": a.clip, "gpx": gpx,
                "per_frame": [list(interpolate(ms, start_ts+i/fps)) for i in range(frames)]},
               open(os.path.splitext(out)[0]+".json","w"))
+    pan_spec = parse_pan(a.pan) if a.pan else (parse_pan_log(a.pan_log) if a.pan_log else None)
     render(ms, pts, start_ts, fps, frames, a.width, a.height, a.layout,
-           os.path.splitext(out)[0]+"_frames")
+           os.path.splitext(out)[0]+"_frames", pan_spec)
     encode(os.path.splitext(out)[0]+"_frames", fps, out)
     print("OK", out, frames, "frames", fps, "fps")
     if a.timeline:
