@@ -165,8 +165,13 @@ def build_timeline(clip_path, overlay_path):
     proj=pm.LoadProject("OFX_Test")
     mp=proj.GetMediaPool()
     items=mp.ImportMedia([clip_path, overlay_path])
-    tl=mp.CreateEmptyTimeline("Telemetry_"+os.path.basename(clip_path))
-    mp.SetCurrentTimeline(tl)
+    mp.CreateEmptyTimeline("Telemetry_"+os.path.basename(clip_path))
+    tl=None
+    for i in range(proj.GetTimelineCount(), 0, -1):
+        t=proj.GetTimelineByIndex(i)
+        if t and (t.GetName() or "").startswith("Telemetry_"): tl=t; break
+    if not tl: sys.exit("timeline not created")
+    proj.SetCurrentTimeline(tl)
     mp.AppendToTimeline([{"mediaPoolItem": items[0], "startFrame":0, "trackIndex":1, "recordFrame":0}])
     mp.AppendToTimeline([{"mediaPoolItem": items[1], "startFrame":0, "trackIndex":2, "recordFrame":0}])
     print("timeline built", tl.GetName())
