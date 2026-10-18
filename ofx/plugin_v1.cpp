@@ -387,8 +387,8 @@ void ReframeFactory::describeInContext(ImageEffectDescriptor &desc, ContextEnum 
 
     p = desc.defineDoubleParam("PAN");
     p->setLabel("Pan (deg)");
-    p->setRange(-360.0, 360.0);
-    p->setDisplayRange(-360.0, 360.0);
+    p->setRange(-180.0, 180.0);
+    p->setDisplayRange(-180.0, 180.0);
     p->setDefault(0.0);
     p->setIncrement(1.0);
     p->setParent(*group);
