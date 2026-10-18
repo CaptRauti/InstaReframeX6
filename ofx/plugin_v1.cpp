@@ -31,6 +31,7 @@ static void plog(const char *fmt, double t, double a, double b, double c, double
 
 // ---------- calibration ----------
 struct Calib {
+    int vw = 3840, vh = 3840;  // source layout the calib was measured on
     float fxi, ffx, ffy, fcx, fcy, fk1, fk2, fk3, fk4, fp1, fp2, fs1, fs2, fs3, fs4;
     float bxi, bfx, bfy, bcx, bcy, bk1, bk2, bk3, bk4, bp1, bp2, bs1, bs2, bs3, bs4;
     float fm[9], bm[9];
@@ -70,6 +71,8 @@ static Calib loadCalib(const std::string &path) {
         else if (k == "front_fx") c.ffx = val;
         else if (k == "front_fy") c.ffy = val;
         else if (k == "front_cx") c.fcx = val;
+        else if (k == "video_w") c.vw = (int)val;
+        else if (k == "video_h") c.vh = (int)val;
         else if (k == "front_cy") c.fcy = val;
         else if (k == "front_k1") c.fk1 = val;
         else if (k == "front_k2") c.fk2 = val;
@@ -185,7 +188,8 @@ public:
         float cr = std::cos(_roll * PI / 180.0f), sr = std::sin(_roll * PI / 180.0f);
         float ct = std::cos(_tilt * PI / 180.0f), st = std::sin(_tilt * PI / 180.0f);
         float cp = std::cos(_pan * PI / 180.0f), sp = std::sin(_pan * PI / 180.0f);
-        float rmax = std::min(halfW, (float)srcH) * 0.5f * 0.97f;
+        float s0 = std::min(halfW / c.vw, (float)srcH / c.vh);
+        float rx = (c.vw * 0.5f) * s0 * 0.98f, ry = rx;
         std::atomic<long> written{0}, skipped{0};
         static long lastlog = 0;
         if (++lastlog <= 3) {
@@ -225,8 +229,8 @@ public:
 
                 // Resolve feeds the source scaled to timeline resolution: adapt calibration
                 // (reference lens image is 3840x3840) to the actual source size
-                float sx = halfW / 3840.0f, sy = (float)srcH / 3840.0f;
-                fx *= sx; cx *= sx; fy *= sy; cy *= sy;
+                float s = std::min(halfW / c.vw, (float)srcH / c.vh);
+                fx *= s; fy *= s; cx *= s; cy = cy * s + ((float)srcH - c.vh * s) * 0.5f;
 
                 float Xl = m[0]*x3 + m[1]*y3 + m[2]*z3;
                 float Yl = m[3]*x3 + m[4]*y3 + m[5]*z3;
@@ -261,7 +265,7 @@ public:
 
                 // bounds in stream space: rmax circle + inside half frame
                 float du = u - cx, dv = v - cy;
-                if (std::sqrt(du*du + dv*dv) > rmax) { skipped++; continue; }
+                if ((du*du)/(rx*rx) + (dv*dv)/(ry*ry) > 1.0f) { skipped++; continue; }
                 if (u < 0.0f || u > halfW - 1.0f || v < 0.0f || v > srcH - 1.0f) { skipped++; continue; }
 
                 // map stream coords to combined frame: front=left half, back=right half
