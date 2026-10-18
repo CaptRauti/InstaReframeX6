@@ -151,7 +151,7 @@ def parse_pan(s):
     out.sort()
     return out
 
-def render(ms, pts, start_ts, fps, frames, width, height, layout, outdir, pan_spec=None):
+def render(ms, pts, start_ts, fps, frames, width, height, layout, outdir, pan_spec=None, text_world=False):
     from PIL import Image, ImageDraw, ImageFont
     font_path = "C:/Windows/Fonts/segoeui.ttf"
     if not os.path.exists(font_path): font_path = "C:/Windows/Fonts/arial.ttf"
@@ -165,7 +165,7 @@ def render(ms, pts, start_ts, fps, frames, width, height, layout, outdir, pan_sp
         pan = pan_from_spec(pan_spec, t - start_ts) if pan_spec else 0.0
         img = Image.new("RGBA", (width, height), (0,0,0,0))
         if layout == "holo":
-            render_holo(img, width, height, sp, hd, ele, dist, pan, pts, t, font, font2)
+            render_holo(img, width, height, sp, hd, ele, dist, pan, pts, t, font, font2, text_world)
         else:
             d = ImageDraw.Draw(img)
             x = int(width*0.06); y = int(height*0.82)
@@ -184,11 +184,12 @@ def render(ms, pts, start_ts, fps, frames, width, height, layout, outdir, pan_sp
                     d.ellipse((mcx-4, mcy-4, mcx+4, mcy+4), fill=(255,80,80,230))
         img.save(os.path.join(outdir, f"f{i:06d}.png"))
 
-def render_holo(img, width, height, sp, hd, ele, dist, pan, pts, t, font, font2):
+def render_holo(img, width, height, sp, hd, ele, dist, pan, pts, t, font, font2, text_world=False):
     """Holographic dashboard anchored to world orientation:
     ring of cardinal directions rotates with pan, trail minimap heading-up,
     glowing cyan strokes, corner brackets."""
     from PIL import Image, ImageDraw, ImageFilter
+    fs_big = int(height*0.045)
     glow = Image.new("RGBA", (width, height), (0,0,0,0))
     sharp = Image.new("RGBA", (width, height), (0,0,0,0))
     dg = ImageDraw.Draw(glow)
@@ -217,11 +218,16 @@ def render_holo(img, width, height, sp, hd, ele, dist, pan, pts, t, font, font2)
     ds.line((cx, cy, cx + R*0.8*math.cos(a), cy + R*0.8*math.sin(a)), fill=(255,90,90,230), width=max(3, width//180))
     ds.ellipse((cx-3, cy-3, cx+3, cy+3), fill=white)
 
-    # --- speed text, center, glowing
+    # --- speed text: screen-center (upright) or world-anchored in travel direction
     txt = f"{sp*3.6:.1f} km/h"
     tb = ds.textbbox((0,0), txt, font=font)
     tw = tb[2]-tb[0]
-    tx = (width-tw)/2; ty = height*0.62
+    if text_world:
+        a = math.radians(hd - pan - 90)
+        tx = cx + R*0.55*math.cos(a) - tw/2
+        ty = cy + R*0.55*math.sin(a) - fs_big//2
+    else:
+        tx = (width-tw)/2; ty = height*0.62
     ds.text((tx, ty), txt, font=font, fill=white)
     dg.text((tx, ty), txt, font=font, fill=cyan)
     # data line under speed
@@ -291,6 +297,7 @@ if __name__ == "__main__":
     ap.add_argument("--layout", default="full", choices=["minimal","full","map","holo"])
     ap.add_argument("--pan", default=None, help="pan keyframes 't:deg,t:deg' matching OFX PAN keyframes")
     ap.add_argument("--pan-log", default=None, help="OFX render log (reframe_ofx.log) — reads pan(t) directly from the plugin")
+    ap.add_argument("--text-anchor", default="screen", choices=["screen","world"], help="speed text: fixed on screen, or flying in travel direction (world-anchored)")
     ap.add_argument("--width", type=int, default=1080)
     ap.add_argument("--height", type=int, default=1920)
     ap.add_argument("--tz", type=int, default=2, help="camera-local -> UTC offset hours")
@@ -327,7 +334,7 @@ if __name__ == "__main__":
               open(os.path.splitext(out)[0]+".json","w"))
     pan_spec = parse_pan(a.pan) if a.pan else (parse_pan_log(a.pan_log) if a.pan_log else None)
     render(ms, pts, start_ts, fps, frames, a.width, a.height, a.layout,
-           os.path.splitext(out)[0]+"_frames", pan_spec)
+           os.path.splitext(out)[0]+"_frames", pan_spec, a.text_anchor == "world")
     encode(os.path.splitext(out)[0]+"_frames", fps, out)
     print("OK", out, frames, "frames", fps, "fps")
     if a.timeline:
