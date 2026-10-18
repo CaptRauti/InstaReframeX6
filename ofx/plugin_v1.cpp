@@ -380,13 +380,15 @@ void ReframeFactory::describeInContext(ImageEffectDescriptor &desc, ContextEnum 
     p = desc.defineDoubleParam("FOV");
     p->setLabel("Field of View (deg)");
     p->setRange(10.0, 170.0);
+    p->setDisplayRange(10.0, 170.0);
     p->setDefault(90.0);
     p->setIncrement(1.0);
     p->setParent(*group);
 
     p = desc.defineDoubleParam("PAN");
     p->setLabel("Pan (deg)");
-    p->setRange(-180.0, 180.0);
+    p->setRange(-360.0, 360.0);
+    p->setDisplayRange(-360.0, 360.0);
     p->setDefault(0.0);
     p->setIncrement(1.0);
     p->setParent(*group);
@@ -394,6 +396,7 @@ void ReframeFactory::describeInContext(ImageEffectDescriptor &desc, ContextEnum 
     p = desc.defineDoubleParam("TILT");
     p->setLabel("Tilt (deg)");
     p->setRange(-90.0, 90.0);
+    p->setDisplayRange(-90.0, 90.0);
     p->setDefault(0.0);
     p->setIncrement(1.0);
     p->setParent(*group);
@@ -401,6 +404,7 @@ void ReframeFactory::describeInContext(ImageEffectDescriptor &desc, ContextEnum 
     p = desc.defineDoubleParam("ROLL");
     p->setLabel("Roll (deg)");
     p->setRange(-180.0, 180.0);
+    p->setDisplayRange(-180.0, 180.0);
     p->setDefault(0.0);
     p->setIncrement(1.0);
     p->setParent(*group);
@@ -408,6 +412,7 @@ void ReframeFactory::describeInContext(ImageEffectDescriptor &desc, ContextEnum 
     p = desc.defineDoubleParam("BYAW");
     p->setLabel("Seam yaw (deg)");
     p->setRange(-10.0, 10.0);
+    p->setDisplayRange(-10.0, 10.0);
     p->setDefault(0.0);
     p->setIncrement(0.1);
     p->setParent(*group);
@@ -415,6 +420,7 @@ void ReframeFactory::describeInContext(ImageEffectDescriptor &desc, ContextEnum 
     p = desc.defineDoubleParam("BPITCH");
     p->setLabel("Seam pitch (deg)");
     p->setRange(-10.0, 10.0);
+    p->setDisplayRange(-10.0, 10.0);
     p->setDefault(0.0);
     p->setIncrement(0.1);
     p->setParent(*group);
