@@ -29,7 +29,7 @@ from xml.etree import ElementTree as ET
 FFMPEG = r"C:/Users/stefa/AppData/Local/hermes/tools/ffmpeg-9.0.1-win32-x64/bin/ffmpeg.exe"
 
 def clip_start_from_name(name):
-    m = re.search(r"VID_(\d{8})_(\d{6})", name)
+    m = re.search(r"(?:VID|LRV)_(\d{8})_(\d{6})", name)
     if not m: return None
     d, t = m.group(1), m.group(2)
     return dt.datetime(int(d[0:4]), int(d[4:6]), int(d[6:8]),
@@ -37,8 +37,8 @@ def clip_start_from_name(name):
 
 def clip_fps_duration(path):
     out = subprocess.run([FFMPEG, "-i", path], capture_output=True, text=True)
-    m = re.search(r"(\d+) fps", out.stderr)
-    fps = int(m.group(1)) if m else 50
+    m = re.search(r"([\d.]+) fps", out.stderr)
+    fps = float(m.group(1)) if m else 50
     m2 = re.search(r"Duration: (\d+):(\d+):(\d+)\.(\d+)", out.stderr)
     dur = 0
     if m2:
